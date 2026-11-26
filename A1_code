@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+from collections import Counter
+from pathlib import Path
+from xml.etree import ElementTree as ET
+import spacy
+import sentencepiece as spm
+from transformers import AutoTokenizer
+
+# "A0" and A1
+
+# please install:
+# python -m pip install spacy, sentencepiece, transformers
+# python -m spacy download en_core_web_sm, fr_core_news_sm, de_core_news_sm et fi_core_news_sm
+
+# no available "tu_core_news_sm" for turkish: spacy.blank("tr")
+
+
+LANGUAGES = ("English", "French", "German", "Finnish", "Turkish")
+SPACY_MODELS = {
+    "English": "en_core_web_sm",
+    "French": "fr_core_news_sm",
+    "German": "de_core_news_sm",
+    "Finnish": "fi_core_news_sm",
+}
+BPE_VOCAB_SIZES = (2_000, 8_000, 32_000)
+XLMR_MODEL = str(Path(__file__).resolve().parent / "xlm-roberta-tokenizer")
+
+NT_BOOKS = (
+    "MAT", "MAR", "LUK", "JOH", "ACT", "ROM", "1CO", "2CO", "GAL",
+    "EPH", "PHI", "COL", "1TH", "2TH", "1TI", "2TI", "TIT", "PHM",
+    "HEB", "JAM", "1PE", "2PE", "1JO", "2JO", "3JO", "JUD", "REV",
+)
+BOOK_ORDER = {code: position for position, code in enumerate(NT_BOOKS)}
+VERSE_ID_PATTERN = re.compile(r"b\.([A-Z0-9]+)\.(\d+)\.(\d+)")
+
+
+def local_xml(language: str, data_dir: Path) -> Path:
+    path = data_dir / f"{language}.xml"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no file in {path}."
+        )
+    return path
+
+
+def extract_nt_verses(xml_path: Path) -> dict[str, str]:
+    """identifiants associated to text"""
+    root = ET.parse(xml_path).getroot()
+    verses: dict[str, str] = {}
+    found_books: set[str] = set()
+
+    for book in root.iter("div"):
+        if book.get("type") != "book":
+            continue
+        book_id = book.get("id", "")
+        if not book_id.startswith("b.") or book_id[2:] not in BOOK_ORDER:
+            continue
+        book_code = book_id[2:]
+        found_books.add(book_code)
+
+        for seg in book.iter("seg"):
+            verse_id = seg.get("id", "")
+            match = VERSE_ID_PATTERN.fullmatch(verse_id)
+            # to take into account xml indentation
+            verses[verse_id] = " ".join("".join(seg.itertext()).split())
+
+    return verses
+
+
+def verse_sort_key(verse_id: str) -> tuple[int, int, int]:
+    """sort by book - chapter number - verse"""
+    match = VERSE_ID_PATTERN.fullmatch(verse_id)
+    book, chapter, verse = match.groups()
+    return BOOK_ORDER[book], int(chapter), int(verse)
+
+
+def align_nonempty(verses_by_language: dict[str, dict[str, str]]) -> list[str]:
+    """take only the verses that are non empty in all language"""
+    common_ids = set.intersection(*(set(verses_by_language[lang]) for lang in LANGUAGES))
+    kept_ids = [
+        verse_id for verse_id in common_ids
+        if all(verses_by_language[lang][verse_id].strip() for lang in LANGUAGES)
+    ]
+    return sorted(kept_ids, key=verse_sort_key)
+
+
+def save_tsv(
+    output: Path, verse_ids: list[str], verses_by_language: dict[str, dict[str, str]]
+    ) -> None:
+    """one lign per verse"""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(("verse_id", *LANGUAGES))
+        for verse_id in verse_ids:
+            writer.writerow((verse_id, *(verses_by_language[lang][verse_id] for lang in LANGUAGES)))
+
+
+def save_rank_frequency(tokens_by_verse: list[list[str]], destination: Path) -> dict[str, int | float]:
+    """rank type and count for every type"""
+    counts = Counter(token for verse_tokens in tokens_by_verse for token in verse_tokens)
+    # second criterion makes ex aequo order reproducible
+    ranked_types = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    with destination.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("rank", "type", "count"))
+        for rank, (token, count) in enumerate(ranked_types, start=1):
+            writer.writerow((rank, token, count))
+
+    hapax = sum(count == 1 for count in counts.values())
+    return {
+        "n_tokens": sum(counts.values()),
+        "n_types": len(counts),
+        "n_hapax": hapax,
+        "hapax_type_ratio": hapax / len(counts),
+    }
+
+
+def whitespace_tokens(verses: list[str], *, lowercase: bool) -> list[list[str]]:
+    """keep the punctuation"""
+    return [(verse.lower() if lowercase else verse).split() for verse in verses]
+
+
+def spacy_tokens(verses: list[str], language: str) -> list[list[str]]:
+    """tokenize with spaCy, take away the punctuation, and put everything in little letters"""
+    if language == "Turkish":
+        nlp = spacy.blank("tr")
+    else:
+        model_name = SPACY_MODELS[language]
+        try:
+            nlp = spacy.load(model_name)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Modèle spaCy manquant : python -m spacy download {model_name}"
+            ) from exc
+
+    return [
+        [tok.text.lower() for tok in nlp.tokenizer(verse) if not (tok.is_punct or tok.is_space)]
+        for verse in verses
+    ]
+
+
+def train_bpe_models(
+    verses: list[str], language: str, results_dir: Path
+) -> list[tuple[int, int, list[list[str]]]]:
+    """train BPE 2k 8k and 32k, then encode the same verses"""
+    corpus_dir = results_dir / "corpus"
+    models_dir = results_dir / "bpe_models"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    corpus_path = corpus_dir / f"{language}_aligned_nt.txt"
+    with corpus_path.open("w", encoding="utf-8") as handle:
+        for verse in verses:
+            handle.write(verse + "\n")
+
+    outputs = []
+    for vocab_size in BPE_VOCAB_SIZES:
+        model_prefix = models_dir / f"{language}_bpe_{vocab_size}"
+        spm.SentencePieceTrainer.train(
+            input=str(corpus_path),
+            model_prefix=str(model_prefix),
+            vocab_size=vocab_size,
+            model_type="bpe",
+            character_coverage=1.0,
+            hard_vocab_limit=False,
+            minloglevel=2,
+        )
+        model = spm.SentencePieceProcessor(model_file=str(model_prefix) + ".model")
+        actual_vocab_size = model.get_piece_size()
+        tokens_by_verse = [model.encode(verse, out_type=str) for verse in verses]
+        outputs.append((vocab_size, actual_vocab_size, tokens_by_verse))
+    return outputs
+
+
+def load_xlmr(model_name: str):
+    """only load the pretrained tokenizer"""
+    try:
+        return AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"impossible to launch {model_name!r}. "
+        ) from exc
+
+
+def compute_a1(verses_by_language: dict[str, dict[str, str]],
+               verse_ids: list[str], results_dir: Path, xlmr_model: str) -> None:
+    """distributions rank frequency per language"""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    distributions_dir = results_dir / "rank_frequency"
+    distributions_dir.mkdir(exist_ok=True)
+    xlmr = load_xlmr(xlmr_model)
+    summary_rows = []
+
+    def record(language: str, method: str, tokens_by_verse: list[list[str]],
+               tokenizer_name: str = "", requested_vocab_size: int | str = "",
+               model_vocab_size: int | str = "") -> None:
+        destination = distributions_dir / f"{language}_{method}.csv"
+        stats = save_rank_frequency(tokens_by_verse, destination)
+        summary_rows.append({
+            "language": language,
+            "method": method,
+            "tokenizer": tokenizer_name,
+            "requested_vocab_size": requested_vocab_size,
+            "model_vocab_size": model_vocab_size,
+            "n_verses": len(verse_ids),
+            **stats,
+        })
+        print(f"  {method}: {stats['n_tokens']} tokens, {stats['n_types']} types")
+
+    for language in LANGUAGES:
+        verses = [verses_by_language[language][verse_id] for verse_id in verse_ids]
+        print(f"Tokenisation : {language}")
+        record(language, "whitespace_raw", whitespace_tokens(verses, lowercase=False))
+        record(language, "whitespace_lower", whitespace_tokens(verses, lowercase=True))
+        tokenizer_name = "spacy.blank(tr)" if language == "Turkish" else SPACY_MODELS[language]
+        record(language, "spacy_lower_no_punct", spacy_tokens(verses, language), tokenizer_name)
+
+        for requested_size, actual_size, bpe_tokens in train_bpe_models(verses, language, results_dir):
+            record(language, f"bpe_{requested_size}", bpe_tokens,
+                   "SentencePiece BPE", requested_size, actual_size)
+
+        record(language, "xlmr", [xlmr.tokenize(verse) for verse in verses],
+               xlmr_model, model_vocab_size=len(xlmr))
+
+    summary_path = results_dir / "summary.csv"
+    with summary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=(
+            "language", "method", "tokenizer", "requested_vocab_size",
+            "model_vocab_size", "n_verses", "n_tokens", "n_types", "n_hapax",
+            "hapax_type_ratio",
+        ))
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    print(f"distributions : {distributions_dir.resolve()}")
+    print(f"summary : {summary_path.resolve()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "bibles",
+                        help="xml files")
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "aligned_nt.tsv",
+                        help="produced tsv file")
+    parser.add_argument("--results-dir", type=Path, default=Path(__file__).resolve().parent / "a1_results",
+                        help="distributions and bpe models")
+    parser.add_argument("--xlmr-model", default=XLMR_MODEL,
+                        help="huggingface id or local path xlm-r")
+    args = parser.parse_args()
+
+    verses_by_language: dict[str, dict[str, str]] = {}
+    for language in LANGUAGES:
+        xml_path = local_xml(language, args.data_dir)
+        verses = extract_nt_verses(xml_path)
+        verses_by_language[language] = verses
+        print(f"{language}: {len(verses)} NT verses, "
+              f"{sum(bool(text) for text in verses.values())} non empty")
+
+    shared_ids = set.intersection(*(set(verses_by_language[lang]) for lang in LANGUAGES))
+    verse_ids = align_nonempty(verses_by_language)
+
+    save_tsv(args.output, verse_ids, verses_by_language)
+    print(f"{len(shared_ids)} common ids ; {len(verse_ids)} verses "
+          f"common and non empty")
+    print(f"results: {args.output.resolve()}")
+    compute_a1(verses_by_language, verse_ids, args.results_dir, args.xlmr_model)
+
+
+if __name__ == "__main__":
+    main()
